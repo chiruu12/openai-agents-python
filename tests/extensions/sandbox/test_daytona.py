@@ -6,6 +6,7 @@ import importlib
 import io
 import shlex
 import sys
+import tarfile
 import types
 import uuid
 from collections import deque
@@ -37,7 +38,7 @@ from agents.sandbox.entries import (
 from agents.sandbox.entries.mounts.base import InContainerMountAdapter
 from agents.sandbox.errors import ExecTimeoutError, ExecTransportError, MountConfigError
 from agents.sandbox.files import EntryKind
-from agents.sandbox.manifest import Environment
+from agents.sandbox.manifest import Environment, ProcessEnvValue
 from agents.sandbox.materialization import MaterializedFile
 from agents.sandbox.session.base_sandbox_session import (
     _MKDIR_ACCESS_CHECK_SCRIPT,
@@ -604,7 +605,7 @@ class TestDaytonaSandbox:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Verify manifest env vars are not passed into Daytona's create-time env shell."""
+        """Verify ordinary manifest env vars stay scoped to Daytona commands."""
 
         daytona_module = _load_daytona_module(monkeypatch)
 
@@ -625,6 +626,460 @@ class TestDaytonaSandbox:
             "SHARED": "option",
             "ONLY_OPTION": "1",
         }
+
+    @pytest.mark.asyncio
+    async def test_process_environment_uses_creation_env_not_command_text(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-protected-value"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            session = await client.create(
+                snapshot=_RestorableSnapshot(id="snapshot"),
+                manifest=manifest,
+                options=daytona_module.DaytonaSandboxClientOptions(),
+            )
+            sandbox = _FakeAsyncDaytona.current_sandbox
+            assert sandbox is not None
+            await session.exec("true", shell=False)
+
+        params, _timeout = _FakeAsyncDaytona.create_calls[0]
+        assert cast(Any, params).env_vars == {name: secret}
+        _session_id, request, _kwargs = sandbox.process.execute_session_command_calls[0]
+        assert secret not in cast(str, cast(Any, request).command)
+
+    @pytest.mark.asyncio
+    async def test_protected_create_surfaces_failed_cleanup_identity(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-protected-value"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )
+
+        async def fail_delete(sandbox: _FakeDaytonaSandbox) -> None:
+            sandbox.delete_calls += 1
+            raise RuntimeError(f"cleanup failed with {secret}")
+
+        def fail_snapshot_resolution(*_args: object, **_kwargs: object) -> object:
+            raise RuntimeError(f"snapshot failed with {secret}")
+
+        monkeypatch.setattr(_FakeDaytonaSandbox, "delete", fail_delete)
+        monkeypatch.setattr(daytona_module, "resolve_snapshot", fail_snapshot_resolution)
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            with pytest.raises(ValueError, match="sandbox_id='sandbox-123'") as exc_info:
+                await client.create(
+                    manifest=manifest,
+                    options=daytona_module.DaytonaSandboxClientOptions(),
+                )
+
+        assert secret not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+
+    @pytest.mark.asyncio
+    async def test_protected_shutdown_surfaces_current_sandbox_delete_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-protected-value"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        sandbox = _FakeDaytonaSandbox(sandbox_id="protected-sandbox")
+
+        async def fail_delete() -> None:
+            raise RuntimeError(f"cleanup failed with {secret}")
+
+        monkeypatch.setattr(sandbox, "delete", fail_delete)
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=manifest,
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id=sandbox.id,
+            ),
+            sandbox=sandbox,
+        )
+
+        with pytest.raises(RuntimeError, match="protected process environment") as exc_info:
+            await session.shutdown()
+
+        assert secret not in str(exc_info.value)
+        assert session.state.sandbox_id == "protected-sandbox"
+
+    @pytest.mark.asyncio
+    async def test_protected_shutdown_accepts_missing_current_sandbox(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        monkeypatch.setenv(name, "daytona-protected-value")
+
+        class _FakeNotFound(Exception):
+            pass
+
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        sandbox = _FakeDaytonaSandbox(sandbox_id="protected-sandbox")
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_not_found_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        monkeypatch.setattr(sandbox, "delete", AsyncMock(side_effect=_FakeNotFound()))
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=manifest,
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id=sandbox.id,
+            ),
+            sandbox=sandbox,
+        )
+
+        await session.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_resume_rebind_recreates_with_current_process_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        monkeypatch.setenv(name, "old-value")
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+
+        async def persist_snapshot(_session: BaseSandboxSession) -> None:
+            return None
+
+        monkeypatch.setattr(
+            daytona_module.DaytonaSandboxSession,
+            "_persist_snapshot",
+            persist_snapshot,
+        )
+
+        async def start_without_workspace_setup(_session: BaseSandboxSession) -> None:
+            return None
+
+        monkeypatch.setattr(BaseSandboxSession, "start", start_without_workspace_setup)
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            session = await client.create(
+                snapshot=_RestorableSnapshot(id="snapshot"),
+                manifest=manifest,
+                options=daytona_module.DaytonaSandboxClientOptions(),
+            )
+            state = session.state
+            previous_sandbox_id = state.sandbox_id
+            monkeypatch.setenv(name, "current-value")
+            _FakeAsyncDaytona.create_calls.clear()
+            _FakeAsyncDaytona.get_calls.clear()
+
+            resumed = await client.resume(state)
+            assert _FakeAsyncDaytona.get_calls == []
+            assert _FakeAsyncDaytona.create_calls == []
+            await resumed.start()
+
+        assert _FakeAsyncDaytona.get_calls == [previous_sandbox_id]
+        assert len(_FakeAsyncDaytona.create_calls) == 1
+        params, _timeout = _FakeAsyncDaytona.create_calls[0]
+        assert cast(Any, params).env_vars == {name: "current-value"}
+        assert resumed._inner._workspace_state_preserved_on_start() is False  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_resume_revalidates_process_environment_before_lookup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        monkeypatch.setenv(name, "current-value")
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            session = await client.create(
+                snapshot=_RestorableSnapshot(id="snapshot"),
+                manifest=manifest,
+                options=daytona_module.DaytonaSandboxClientOptions(),
+            )
+            _FakeAsyncDaytona.get_calls.clear()
+            resumed = await client.resume(session.state)
+            monkeypatch.delenv(name)
+
+            with pytest.raises(ValueError, match="is not set"):
+                await resumed.start()
+
+        assert _FakeAsyncDaytona.get_calls == []
+
+    @pytest.mark.asyncio
+    async def test_resume_rejects_noop_snapshot_before_lookup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        monkeypatch.setenv(name, "current-value")
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id="existing-sandbox",
+        )
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            resumed = await client.resume(state)
+
+            with pytest.raises(ValueError, match="restorable snapshot"):
+                await resumed.start()
+
+        assert _FakeAsyncDaytona.get_calls == []
+        assert _FakeAsyncDaytona.create_calls == []
+
+    @pytest.mark.asyncio
+    async def test_started_replacement_restarts_before_retrying_retirement(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        monkeypatch.setenv(name, "current-value")
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=manifest,
+                snapshot=_RestorableSnapshot(id="snapshot"),
+                sandbox_id="replacement",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="replacement"),
+        )
+        session._process_environment_resume_started = True  # noqa: SLF001
+        session._process_environment_resume_previous_sandbox_id = "previous"  # noqa: SLF001
+        running = AsyncMock(return_value=False)
+        retirement = AsyncMock()
+        base_start = AsyncMock()
+        monkeypatch.setattr(session, "running", running)
+        monkeypatch.setattr(
+            session,
+            "_retire_process_environment_previous_sandbox",
+            retirement,
+        )
+        monkeypatch.setattr(BaseSandboxSession, "start", base_start)
+
+        await session.start()
+
+        running.assert_awaited_once()
+        base_start.assert_awaited_once()
+        retirement.assert_awaited_once()
+        assert session._workspace_state_preserved_on_start() is True  # noqa: SLF001
+        assert session._system_state_preserved_on_start() is True  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_failed_replacement_cleanup_retains_candidate_for_retry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        candidate = _FakeDaytonaSandbox(sandbox_id="candidate")
+        delete_calls = 0
+
+        async def delete_candidate() -> None:
+            nonlocal delete_calls
+            delete_calls += 1
+            if delete_calls == 1:
+                raise RuntimeError("candidate cleanup failed")
+
+        monkeypatch.setattr(candidate, "delete", delete_candidate)
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=Manifest(),
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id="existing",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="existing"),
+        )
+        session._process_environment_failed_candidate_sandbox = candidate  # noqa: SLF001
+        session._process_environment_failed_candidate_sandbox_id = "candidate"  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="candidate cleanup failed"):
+            await session._cleanup_process_environment_failed_candidate()  # noqa: SLF001
+
+        assert session._process_environment_failed_candidate_sandbox is candidate  # noqa: SLF001
+        assert session._process_environment_failed_candidate_sandbox_id == "candidate"  # noqa: SLF001
+
+        await session._cleanup_process_environment_failed_candidate()  # noqa: SLF001
+
+        assert delete_calls == 2
+        assert session._process_environment_failed_candidate_sandbox is None  # noqa: SLF001
+        assert session._process_environment_failed_candidate_sandbox_id is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_failed_replacement_cleanup_clears_missing_candidate(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        class _FakeNotFound(Exception):
+            pass
+
+        candidate = _FakeDaytonaSandbox(sandbox_id="candidate")
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_not_found_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        monkeypatch.setattr(candidate, "delete", AsyncMock(side_effect=_FakeNotFound()))
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=Manifest(),
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id="existing",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="existing"),
+        )
+        session._process_environment_failed_candidate_sandbox = candidate  # noqa: SLF001
+        session._process_environment_failed_candidate_sandbox_id = "candidate"  # noqa: SLF001
+
+        await session._cleanup_process_environment_failed_candidate()  # noqa: SLF001
+
+        assert session._process_environment_failed_candidate_sandbox is None  # noqa: SLF001
+        assert session._process_environment_failed_candidate_sandbox_id is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_previous_retirement_clears_missing_sandbox(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        class _FakeNotFound(Exception):
+            pass
+
+        previous = _FakeDaytonaSandbox(sandbox_id="previous")
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_not_found_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        monkeypatch.setattr(previous, "delete", AsyncMock(side_effect=_FakeNotFound()))
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=Manifest(),
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id="replacement",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="replacement"),
+        )
+        session._process_environment_resume_previous_sandbox_id = "previous"  # noqa: SLF001
+
+        await session._retire_process_environment_previous_sandbox(  # noqa: SLF001
+            previous_sandbox=previous
+        )
+
+        assert session._process_environment_resume_previous_sandbox_id is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_shutdown_clears_missing_deferred_sandbox(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        class _FakeNotFound(Exception):
+            pass
+
+        async def load_missing(_sandbox_id: str) -> _FakeDaytonaSandbox:
+            raise _FakeNotFound()
+
+        monkeypatch.setattr(
+            daytona_module,
+            "_daytona_not_found_error_types",
+            lambda: (_FakeNotFound,),
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=Manifest(),
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id="previous",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="previous"),
+        )
+        session._sandbox = None  # noqa: SLF001
+        session._process_environment_resume_previous_sandbox_id = "previous"  # noqa: SLF001
+        session._process_environment_resume_previous_sandbox_loader = load_missing  # noqa: SLF001
+
+        await session._shutdown_backend()  # noqa: SLF001
+
+        assert session._process_environment_resume_previous_sandbox_id is None  # noqa: SLF001
+
+    @pytest.mark.asyncio
+    async def test_shutdown_surfaces_deferred_sandbox_loader_failure(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+
+        async def fail_load(_sandbox_id: str) -> _FakeDaytonaSandbox:
+            raise RuntimeError("loader failed")
+
+        session = daytona_module.DaytonaSandboxSession.from_state(
+            daytona_module.DaytonaSandboxSessionState(
+                manifest=Manifest(),
+                snapshot=NoopSnapshot(id="snapshot"),
+                sandbox_id="previous",
+            ),
+            sandbox=_FakeDaytonaSandbox(sandbox_id="previous"),
+        )
+        session._sandbox = None  # noqa: SLF001
+        session._process_environment_resume_previous_sandbox_id = "previous"  # noqa: SLF001
+        session._process_environment_resume_previous_sandbox_loader = fail_load  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match="loader failed"):
+            await session._shutdown_backend()  # noqa: SLF001
+
+        assert session._process_environment_resume_previous_sandbox_id == "previous"  # noqa: SLF001
 
     @pytest.mark.asyncio
     async def test_exec_enforces_subsecond_caller_timeout(
@@ -1126,6 +1581,39 @@ class TestDaytonaSandbox:
         assert mount._mounted_paths == [mount_path]
 
     @pytest.mark.asyncio
+    async def test_tar_hydrate_resolves_environment_once_before_workspace_mutation(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=Manifest(root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT),
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        resolve_calls = 0
+        mkdir_calls_during_resolution: list[int] = []
+
+        async def resolve_once() -> dict[str, str]:
+            nonlocal resolve_calls
+            resolve_calls += 1
+            mkdir_calls_during_resolution.append(len(sandbox.fs.create_folder_calls))
+            return {"TOKEN": "snapshot-value"}
+
+        payload = io.BytesIO()
+        with tarfile.open(fileobj=payload, mode="w"):
+            pass
+        payload.seek(0)
+        monkeypatch.setattr(session, "_resolved_envs", resolve_once)
+
+        await session.hydrate_workspace(payload)
+
+        assert resolve_calls == 1
+        assert mkdir_calls_during_resolution == [0]
+
+    @pytest.mark.asyncio
     async def test_persist_workspace_marks_stopped_sandbox_non_retryable(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -1336,6 +1824,111 @@ class TestDaytonaSandbox:
         )
         assert finished.process_id is None
         assert finished.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_pty_uses_out_of_band_process_environment(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-protected-value"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+
+        async with daytona_module.DaytonaSandboxClient(
+            allowed_process_environment_keys={name}
+        ) as client:
+            session = await client.create(
+                manifest=manifest,
+                options=daytona_module.DaytonaSandboxClientOptions(),
+            )
+            sandbox = _FakeAsyncDaytona.current_sandbox
+            assert sandbox is not None
+            await session.pty_exec_start("python3", shell=False, tty=True, yield_time_s=0.05)
+
+        params, _timeout = _FakeAsyncDaytona.create_calls[0]
+        assert cast(Any, params).env_vars == {name: secret}
+        assert sandbox.process.create_pty_session_calls[0]["envs"] is None
+        await session.pty_terminate_all()
+
+    @pytest.mark.asyncio
+    async def test_pty_failure_redacts_process_environment_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-pty-secret"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        provider_error = FileNotFoundError(f"provider failed with {secret}")
+        sandbox.process.create_pty_session_error = provider_error
+
+        with pytest.raises(
+            ExecTransportError,
+            match="protected process environment values",
+        ) as exc_info:
+            await session.pty_exec_start("python3", shell=False, tty=True)
+
+        assert secret not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        assert cast(Any, BaseException.args).__get__(provider_error, type(provider_error)) == ()
+        assert provider_error.__traceback__ is None
+
+    @pytest.mark.asyncio
+    async def test_pty_terminate_failure_redacts_process_environment_values(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        daytona_module = _load_daytona_module(monkeypatch)
+        sandbox = _FakeDaytonaSandbox()
+        name = "SANDBOX_TEST_PROCESS_ENV_VALUE"
+        secret = "daytona-pty-terminate-secret"
+        monkeypatch.setenv(name, secret)
+        manifest = Manifest(
+            root=daytona_module.DEFAULT_DAYTONA_WORKSPACE_ROOT,
+            environment=Environment(value={name: ProcessEnvValue()}),
+        )._with_process_environment_access(name)
+        state = daytona_module.DaytonaSandboxSessionState(
+            manifest=manifest,
+            snapshot=NoopSnapshot(id="snapshot"),
+            sandbox_id=sandbox.id,
+        )
+        session = daytona_module.DaytonaSandboxSession.from_state(state, sandbox=sandbox)
+        provider_error = RuntimeError(f"provider failed with {secret}")
+
+        async def fail_terminate(_entry: object) -> None:
+            raise provider_error
+
+        monkeypatch.setattr(session, "_terminate_pty_entry", fail_terminate)
+        session._pty_sessions[1] = cast(Any, object())  # noqa: SLF001
+
+        with pytest.raises(
+            RuntimeError,
+            match="protected process environment values",
+        ) as exc_info:
+            await session.pty_terminate_all()
+
+        assert secret not in str(exc_info.value)
+        assert exc_info.value.__cause__ is None
+        assert exc_info.value.__context__ is None
+        assert cast(Any, BaseException.args).__get__(provider_error, type(provider_error)) == ()
+        assert provider_error.__traceback__ is None
 
     @pytest.mark.asyncio
     async def test_stop_terminates_live_pty_sessions(self, monkeypatch: pytest.MonkeyPatch) -> None:

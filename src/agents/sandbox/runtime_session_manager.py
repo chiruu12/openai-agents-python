@@ -23,7 +23,6 @@ from ._mount_security import (
     _replace_protected_mount_error,
     _validate_manifest_mount_provenance,
     redact_mount_error_data,
-    validate_manifest_mount_credential_boundaries,
 )
 from .capabilities import Capability
 from .entries import BaseEntry, Dir, Mount, resolve_workspace_path
@@ -596,10 +595,16 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             current_manifest,
             run_as_user=cls._agent_run_as_user(agent),
         )
+        if current_manifest._has_process_environment_values() or (
+            processed_manifest is not None and processed_manifest._has_process_environment_values()
+        ):
+            raise ValueError(
+                "Injected sandbox sessions cannot use ProcessEnvValue bindings; "
+                "use a client-owned fresh session or resume path instead"
+            )
         if processed_manifest is None or processed_manifest == current_manifest:
-            validate_manifest_mount_credential_boundaries(
-                current_manifest,
-                provider_backend_id=session.state.type,
+            await session._validate_manifest_before_provider_probe(
+                manifest=current_manifest,
             )
             running = await session.running()
             await session._validate_manifest_application(
@@ -612,9 +617,8 @@ class SandboxRuntimeSessionManager(Generic[TContext]):
             current_manifest=current_manifest,
             processed_manifest=processed_manifest,
         )
-        validate_manifest_mount_credential_boundaries(
-            processed_manifest,
-            provider_backend_id=session.state.type,
+        await session._validate_manifest_before_provider_probe(
+            manifest=processed_manifest,
         )
         running = await session.running()
         await session._validate_manifest_application(

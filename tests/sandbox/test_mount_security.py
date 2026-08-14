@@ -68,7 +68,7 @@ from agents.sandbox.errors import (
     PtySessionNotFoundError,
     SandboxError,
 )
-from agents.sandbox.manifest import Environment
+from agents.sandbox.manifest import Environment, ProcessEnvValue
 from agents.sandbox.session.base_sandbox_session import BaseSandboxSession
 from agents.sandbox.session.sandbox_client import BaseSandboxClient
 from agents.sandbox.session.sandbox_session import SandboxSession
@@ -3918,6 +3918,77 @@ async def test_operation_error_with_mount_authority_is_replaced() -> None:
         frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
         if "/src/agents/" in frame_path:
             assert sentinel not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+@pytest.mark.asyncio
+async def test_mixed_authority_preserves_safe_process_environment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "SANDBOX_TEST_MISSING_PROCESS_ENV"
+    mount_secret = "mixed-authority-mount-secret"
+    monkeypatch.delenv(name, raising=False)
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=mount_secret,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        },
+        environment=Environment(value={name: ProcessEnvValue()}),
+    )._with_process_environment_access(name)
+
+    @redact_mount_error_data
+    async def resolve(*, manifest: Manifest) -> None:
+        await manifest.resolve_environment()
+
+    with pytest.raises(ValueError, match=f"variable {name!r} is not set") as exc_info:
+        await resolve(manifest=manifest)
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert mount_secret not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_mixed_authority_resume_validation_preserves_safe_process_environment_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    name = "SANDBOX_TEST_MISSING_PROCESS_ENV"
+    mount_secret = "mixed-authority-resume-mount-secret"
+    monkeypatch.delenv(name, raising=False)
+    manifest = Manifest(
+        entries={
+            "data": S3Mount(
+                bucket="bucket",
+                access_key_id="access-key",
+                secret_access_key=mount_secret,
+                mount_strategy=DockerVolumeMountStrategy(driver="rclone"),
+            )
+        },
+        environment=Environment(value={name: ProcessEnvValue()}),
+    )._with_process_environment_access(name)
+    state = TestSessionState(
+        manifest=manifest,
+        snapshot=NoopSnapshot(id="snapshot"),
+    ).model_copy(update={"type": "docker"})
+
+    with pytest.raises(ValueError, match=f"variable {name!r} is not set") as exc_info:
+        state.assert_path_grants_rebound()
+
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
+    traceback = exc_info.value.__traceback__
+    while traceback is not None:
+        frame_path = Path(traceback.tb_frame.f_code.co_filename).as_posix()
+        if "/src/agents/" in frame_path:
+            assert mount_secret not in repr(traceback.tb_frame.f_locals)
         traceback = traceback.tb_next
 
 

@@ -19,6 +19,7 @@ import shlex
 import time
 import uuid
 from collections import deque
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -40,9 +41,12 @@ from ....sandbox.errors import (
     WorkspaceStartError,
     WorkspaceWriteTypeError,
 )
-from ....sandbox.manifest import Manifest
+from ....sandbox.manifest import Manifest, _process_environment_error
 from ....sandbox.session import SandboxSession, SandboxSessionState
-from ....sandbox.session.base_sandbox_session import BaseSandboxSession
+from ....sandbox.session.base_sandbox_session import (
+    BaseSandboxSession,
+    _register_sdk_process_environment_session_type,
+)
 from ....sandbox.session.dependencies import Dependencies
 from ....sandbox.session.manager import Instrumentation
 from ....sandbox.session.pty_output import collect_pty_output
@@ -58,7 +62,7 @@ from ....sandbox.session.pty_types import (
 from ....sandbox.session.runtime_helpers import RESOLVE_WORKSPACE_PATH_HELPER, RuntimeHelperScript
 from ....sandbox.session.sandbox_client import BaseSandboxClient, BaseSandboxClientOptions
 from ....sandbox.session.tar_workspace import shell_tar_exclude_args
-from ....sandbox.snapshot import SnapshotBase, SnapshotSpec, resolve_snapshot
+from ....sandbox.snapshot import NoopSnapshot, SnapshotBase, SnapshotSpec, resolve_snapshot
 from ....sandbox.types import ExecResult, ExposedPortEndpoint, User
 from ....sandbox.util.retry import (
     TRANSIENT_HTTP_STATUS_CODES,
@@ -393,6 +397,7 @@ class _DaytonaPtySessionEntry:
     worker_task: asyncio.Task[None] | None = None
 
 
+@_register_sdk_process_environment_session_type
 class DaytonaSandboxSession(BaseSandboxSession):
     """Daytona-backed sandbox session implementation."""
 
@@ -401,6 +406,11 @@ class DaytonaSandboxSession(BaseSandboxSession):
     _pty_lock: asyncio.Lock
     _pty_sessions: dict[int, _DaytonaPtySessionEntry]
     _reserved_pty_process_ids: set[int]
+    _process_environment_resume_previous_sandbox_id: str | None
+    _process_environment_resume_previous_sandbox_loader: Any
+    _process_environment_resume_start: Callable[[], Awaitable[None]] | None
+    _process_environment_failed_candidate_sandbox_id: str | None
+    _process_environment_failed_candidate_sandbox: Any
 
     def __init__(self, *, state: DaytonaSandboxSessionState, sandbox: Any) -> None:
         self.state = state
@@ -408,6 +418,13 @@ class DaytonaSandboxSession(BaseSandboxSession):
         self._pty_lock = asyncio.Lock()
         self._pty_sessions = {}
         self._reserved_pty_process_ids = set()
+        self._process_environment_start_lock = asyncio.Lock()
+        self._process_environment_resume_started = False
+        self._process_environment_resume_start = None
+        self._process_environment_resume_previous_sandbox_id = None
+        self._process_environment_resume_previous_sandbox_loader = None
+        self._process_environment_failed_candidate_sandbox_id = None
+        self._process_environment_failed_candidate_sandbox = None
 
     @classmethod
     def from_state(
@@ -421,6 +438,74 @@ class DaytonaSandboxSession(BaseSandboxSession):
     @property
     def sandbox_id(self) -> str:
         return self.state.sandbox_id
+
+    @redact_mount_error_data
+    async def start(self) -> None:
+        async with self._process_environment_start_lock:
+            await self._cleanup_process_environment_failed_candidate()
+            if self._process_environment_resume_started:
+                if not await self.running():
+                    self._set_start_state_preserved(True, system=True)
+                    await super().start()
+                await self._retire_process_environment_previous_sandbox()
+                return
+            deferred_start = getattr(self, "_process_environment_resume_start", None)
+            if deferred_start is None:
+                await super().start()
+                return
+            await deferred_start()
+            self._process_environment_resume_start = None
+            self._process_environment_resume_started = True
+
+    async def _cleanup_process_environment_failed_candidate(self) -> None:
+        sandbox_id = self._process_environment_failed_candidate_sandbox_id
+        if sandbox_id is None:
+            return
+        sandbox = self._process_environment_failed_candidate_sandbox
+        if sandbox is None:
+            loader = self._process_environment_resume_previous_sandbox_loader
+            try:
+                sandbox = await loader(sandbox_id)
+            except Exception as error:
+                not_found_error_types = _daytona_not_found_error_types()
+                if not not_found_error_types or not isinstance(error, not_found_error_types):
+                    raise
+                self._process_environment_failed_candidate_sandbox_id = None
+                return
+        try:
+            await sandbox.delete()
+        except Exception as error:
+            not_found_error_types = _daytona_not_found_error_types()
+            if not not_found_error_types or not isinstance(error, not_found_error_types):
+                raise
+        self._process_environment_failed_candidate_sandbox_id = None
+        self._process_environment_failed_candidate_sandbox = None
+
+    async def _retire_process_environment_previous_sandbox(
+        self,
+        *,
+        previous_sandbox: Any = None,
+    ) -> None:
+        previous_sandbox_id = self._process_environment_resume_previous_sandbox_id
+        if previous_sandbox_id is None:
+            return
+        if previous_sandbox is None:
+            loader = self._process_environment_resume_previous_sandbox_loader
+            try:
+                previous_sandbox = await loader(previous_sandbox_id)
+            except Exception as error:
+                not_found_error_types = _daytona_not_found_error_types()
+                if not not_found_error_types or not isinstance(error, not_found_error_types):
+                    raise
+                self._process_environment_resume_previous_sandbox_id = None
+                return
+        try:
+            await previous_sandbox.delete()
+        except Exception as error:
+            not_found_error_types = _daytona_not_found_error_types()
+            if not not_found_error_types or not isinstance(error, not_found_error_types):
+                raise
+        self._process_environment_resume_previous_sandbox_id = None
 
     async def _resolve_exposed_port(self, port: int) -> ExposedPortEndpoint:
         try:
@@ -463,13 +548,44 @@ class DaytonaSandboxSession(BaseSandboxSession):
             ) from e
 
     async def _shutdown_backend(self) -> None:
+        cleanup_error: BaseException | None = None
         try:
-            if self.state.pause_on_exit:
-                await self._sandbox.stop()
-            else:
-                await self._sandbox.delete()
-        except Exception:
-            pass
+            await self._cleanup_process_environment_failed_candidate()
+        except BaseException as exc:
+            cleanup_error = exc
+        deferred_sandbox_id = self._process_environment_resume_previous_sandbox_id
+        if self._sandbox is None and deferred_sandbox_id is not None:
+            try:
+                loader = self._process_environment_resume_previous_sandbox_loader
+                self._sandbox = await loader(deferred_sandbox_id)
+            except Exception as exc:
+                not_found_error_types = _daytona_not_found_error_types()
+                if not_found_error_types and isinstance(exc, not_found_error_types):
+                    self._process_environment_resume_previous_sandbox_id = None
+                elif cleanup_error is None:
+                    cleanup_error = exc
+        if self._sandbox is not None:
+            try:
+                if self.state.pause_on_exit:
+                    await self._sandbox.stop()
+                else:
+                    await self._sandbox.delete()
+            except Exception as exc:
+                not_found_error_types = _daytona_not_found_error_types()
+                if not_found_error_types and isinstance(exc, not_found_error_types):
+                    pass
+                elif (
+                    self.state.manifest._has_process_environment_access() and cleanup_error is None
+                ):
+                    cleanup_error = exc
+        if deferred_sandbox_id is not None and self.state.sandbox_id != deferred_sandbox_id:
+            try:
+                await self._retire_process_environment_previous_sandbox()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            raise cleanup_error from None
 
     async def _validate_path_access(self, path: Path | str, *, for_write: bool = False) -> Path:
         return await self._validate_remote_path_access(path, for_write=for_write)
@@ -545,8 +661,20 @@ class DaytonaSandboxSession(BaseSandboxSession):
             ) from e
 
     async def _resolved_envs(self) -> dict[str, str]:
-        manifest_envs = await self.state.manifest.environment.resolve()
-        return {**self.state.base_env_vars, **manifest_envs}
+        return await self._resolved_command_envs()
+
+    async def _resolved_command_envs(self) -> dict[str, str]:
+        manifest_envs = await self.state.manifest._resolve_environment_without_process_values()
+        process_destinations = {
+            destination
+            for destination, _source in self.state.manifest._declared_process_environment_bindings()
+        }
+        base_envs = {
+            key: value
+            for key, value in self.state.base_env_vars.items()
+            if key not in process_destinations
+        }
+        return {**base_envs, **manifest_envs}
 
     def _coerce_exec_timeout(self, timeout_s: float | None) -> float:
         if timeout_s is None:
@@ -561,7 +689,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         timeout: float | None = None,
     ) -> ExecResult:
         cmd_str = shlex.join(str(c) for c in command)
-        envs = await self._resolved_envs()
+        envs = await self._resolved_command_envs()
         cwd = sandbox_path_str(self.state.manifest.root)
         env_args = (
             " ".join(shlex.quote(f"{key}={value}") for key, value in envs.items()) if envs else ""
@@ -627,6 +755,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
     def supports_pty(self) -> bool:
         return True
 
+    @redact_mount_error_data
     async def pty_exec_start(
         self,
         *command: str | Path,
@@ -640,7 +769,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         PtySize = _import_pty_size()
         sanitized = self._prepare_exec_command(*command, shell=shell, user=user)
         cmd_str = shlex.join(str(part) for part in sanitized)
-        envs = await self._resolved_envs()
+        envs = await self._resolved_envs() if tty else await self._resolved_command_envs()
         cwd = sandbox_path_str(self.state.manifest.root)
         exec_timeout = self._coerce_exec_timeout(timeout)
         timeout_error_types = _daytona_timeout_error_types()
@@ -1041,6 +1170,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 retryable=retryable,
             ) from e
 
+    @redact_mount_error_data
     async def persist_workspace(self) -> io.IOBase:
         def _error_context_summary(error: WorkspaceArchiveReadError) -> dict[str, str]:
             summary = {"message": error.message}
@@ -1120,6 +1250,7 @@ class DaytonaSandboxSession(BaseSandboxSession):
         assert raw is not None
         return io.BytesIO(raw)
 
+    @redact_mount_error_data
     async def hydrate_workspace(self, data: io.IOBase) -> None:
         root = self._workspace_root_path()
         tar_path = f"/tmp/sandbox-hydrate-{self.state.session_id.hex}.tar"
@@ -1145,9 +1276,9 @@ class DaytonaSandboxSession(BaseSandboxSession):
                 cause=e,
             ) from e
 
+        envs = await self._resolved_envs()
         try:
-            await self.mkdir(root, parents=True)
-            envs = await self._resolved_envs()
+            await self._sandbox.fs.create_folder(sandbox_path_str(root), "755")
             await self._sandbox.fs.upload_file(
                 bytes(payload),
                 tar_path,
@@ -1169,7 +1300,6 @@ class DaytonaSandboxSession(BaseSandboxSession):
             raise WorkspaceArchiveWriteError(path=root, cause=e) from e
         finally:
             try:
-                envs = await self._resolved_envs()
                 await self._sandbox.process.exec(
                     f"rm -f -- {shlex.quote(tar_path)}",
                     env=envs or None,
@@ -1192,6 +1322,8 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         api_url: str | None = None,
         instrumentation: Instrumentation | None = None,
         dependencies: Dependencies | None = None,
+        allowed_process_environment_keys: Iterable[str] = (),
+        process_environment_bindings: Mapping[str, str] | None = None,
     ) -> None:
         AsyncDaytona, DaytonaConfig, _, _ = _import_daytona_sdk()
         config = DaytonaConfig(api_key=api_key, api_url=api_url) if (api_key or api_url) else None
@@ -1200,6 +1332,10 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             instrumentation if instrumentation is not None else Instrumentation()
         )
         self._dependencies = dependencies
+        self._configure_process_environment_bindings(
+            allowed_process_environment_keys=allowed_process_environment_keys,
+            process_environment_bindings=process_environment_bindings,
+        )
 
     async def _build_create_params(
         self,
@@ -1208,13 +1344,19 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         image: str | None,
         env_vars: dict[str, str] | None,
         manifest: Manifest,
+        process_envs: dict[str, str] | None = None,
         name: str | None = None,
         resources: DaytonaSandboxResources | None = None,
         auto_stop_interval: int | None = None,
     ) -> Any:
         _, _, CreateSandboxFromSnapshotParams, CreateSandboxFromImageParams = _import_daytona_sdk()
         base_envs = dict(env_vars or {})
-        creation_envs = base_envs or None
+        resolved_process_envs = (
+            process_envs
+            if process_envs is not None
+            else await manifest._resolve_process_environment_values()
+        )
+        creation_envs = {**base_envs, **resolved_process_envs} or None
 
         if sandbox_snapshot_name:
             return CreateSandboxFromSnapshotParams(
@@ -1259,7 +1401,7 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
     ) -> SandboxSession:
         if manifest is None:
             manifest = Manifest(root=DEFAULT_DAYTONA_WORKSPACE_ROOT)
-        self._validate_manifest_for_create(manifest)
+        manifest = self._validate_manifest_for_create(manifest)
 
         timeouts_in = options.timeouts
         if isinstance(timeouts_in, DaytonaSandboxTimeouts):
@@ -1281,29 +1423,46 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
             resources=options.resources,
             auto_stop_interval=options.auto_stop_interval,
         )
-        daytona_sandbox = await self._daytona.create(params, timeout=options.create_timeout)
+        daytona_sandbox = None
+        try:
+            daytona_sandbox = await self._daytona.create(params, timeout=options.create_timeout)
 
-        snapshot_instance = resolve_snapshot(snapshot, str(session_id))
-        state = DaytonaSandboxSessionState(
-            session_id=session_id,
-            manifest=manifest,
-            snapshot=snapshot_instance,
-            sandbox_id=daytona_sandbox.id,
-            sandbox_snapshot_name=options.sandbox_snapshot_name,
-            image=options.image,
-            base_env_vars=dict(options.env_vars or {}),
-            pause_on_exit=options.pause_on_exit,
-            create_timeout=options.create_timeout,
-            start_timeout=options.start_timeout,
-            name=sandbox_name,
-            resources=options.resources,
-            auto_stop_interval=options.auto_stop_interval,
-            timeouts=timeouts,
-            exposed_ports=options.exposed_ports,
-            exposed_port_url_ttl_s=options.exposed_port_url_ttl_s,
-        )
-        inner = DaytonaSandboxSession.from_state(state, sandbox=daytona_sandbox)
-        return self._wrap_session(inner, instrumentation=self._instrumentation)
+            snapshot_instance = resolve_snapshot(snapshot, str(session_id))
+            state = DaytonaSandboxSessionState(
+                session_id=session_id,
+                manifest=manifest,
+                snapshot=snapshot_instance,
+                sandbox_id=daytona_sandbox.id,
+                sandbox_snapshot_name=options.sandbox_snapshot_name,
+                image=options.image,
+                base_env_vars=dict(options.env_vars or {}),
+                pause_on_exit=options.pause_on_exit,
+                create_timeout=options.create_timeout,
+                start_timeout=options.start_timeout,
+                name=sandbox_name,
+                resources=options.resources,
+                auto_stop_interval=options.auto_stop_interval,
+                timeouts=timeouts,
+                exposed_ports=options.exposed_ports,
+                exposed_port_url_ttl_s=options.exposed_port_url_ttl_s,
+            )
+            inner = DaytonaSandboxSession.from_state(state, sandbox=daytona_sandbox)
+            return self._wrap_session(inner, instrumentation=self._instrumentation)
+        except BaseException:
+            if daytona_sandbox is not None:
+                try:
+                    await daytona_sandbox.delete()
+                except Exception as cleanup_error:
+                    not_found_error_types = _daytona_not_found_error_types()
+                    if manifest._has_process_environment_values() and (
+                        not not_found_error_types
+                        or not isinstance(cleanup_error, not_found_error_types)
+                    ):
+                        raise _process_environment_error(
+                            "Daytona failed to clean up protected create resources; "
+                            f"sandbox_id={daytona_sandbox.id!r}"
+                        ) from None
+            raise
 
     async def close(self) -> None:
         """Close the underlying AsyncDaytona HTTP client session."""
@@ -1322,7 +1481,12 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
         try:
             await inner.shutdown()
         except Exception:
-            pass
+            if (
+                inner._process_environment_resume_previous_sandbox_id is not None
+                or inner._process_environment_failed_candidate_sandbox_id is not None
+                or inner.state.manifest._has_process_environment_access()
+            ):
+                raise
         return session
 
     @redact_mount_error_data
@@ -1332,18 +1496,99 @@ class DaytonaSandboxClient(BaseSandboxClient[DaytonaSandboxClientOptions]):
     ) -> SandboxSession:
         if not isinstance(state, DaytonaSandboxSessionState):
             raise TypeError("DaytonaSandboxClient.resume expects a DaytonaSandboxSessionState")
+        state.manifest = self._bind_process_environment_manifest(state.manifest)
         state.assert_path_grants_rebound()
+
+        if state.manifest._has_process_environment_values():
+            previous_sandbox_id = state.sandbox_id
+            previous_workspace_root_ready = state.workspace_root_ready
+            inner = DaytonaSandboxSession.from_state(state, sandbox=None)
+            inner._process_environment_resume_previous_sandbox_id = previous_sandbox_id
+            inner._process_environment_resume_previous_sandbox_loader = self._daytona.get
+
+            async def start_replacement() -> None:
+                if isinstance(state.snapshot, NoopSnapshot):
+                    raise _process_environment_error(
+                        "Daytona cannot resume ProcessEnvValue without a live workspace or "
+                        "restorable snapshot; use a restorable snapshot to preserve the "
+                        "workspace"
+                    )
+                process_envs = state.manifest._snapshot_process_environment_values()
+                previous_sandbox = None
+                daytona_sandbox = None
+                try:
+                    try:
+                        previous_sandbox = await self._daytona.get(previous_sandbox_id)
+                    except Exception as error:
+                        not_found_error_types = _daytona_not_found_error_types()
+                        if not not_found_error_types or not isinstance(
+                            error, not_found_error_types
+                        ):
+                            raise
+                        previous_sandbox = None
+                    if previous_sandbox is not None:
+                        previous_session = DaytonaSandboxSession.from_state(
+                            state, sandbox=previous_sandbox
+                        )
+                        previous_session.set_dependencies(inner._dependencies)
+                        if await previous_session.running():
+                            await previous_session._persist_snapshot()
+                    if not await state.snapshot.restorable(dependencies=inner._dependencies):
+                        raise _process_environment_error(
+                            "Daytona cannot resume ProcessEnvValue without a live workspace or "
+                            "restorable snapshot; use a restorable snapshot to preserve the "
+                            "workspace"
+                        )
+                    params = await self._build_create_params(
+                        sandbox_snapshot_name=state.sandbox_snapshot_name,
+                        image=state.image,
+                        env_vars=state.base_env_vars,
+                        manifest=state.manifest,
+                        process_envs=process_envs,
+                        name=state.name,
+                        resources=state.resources,
+                        auto_stop_interval=state.auto_stop_interval,
+                    )
+                    daytona_sandbox = await self._daytona.create(
+                        params, timeout=state.create_timeout
+                    )
+                    state.sandbox_id = daytona_sandbox.id
+                    state.workspace_root_ready = False
+                    inner._sandbox = daytona_sandbox
+                    inner._set_start_state_preserved(False, system=False)
+                    await BaseSandboxSession.start(inner)
+                except BaseException:
+                    if daytona_sandbox is not None:
+                        inner._process_environment_failed_candidate_sandbox = daytona_sandbox
+                        inner._process_environment_failed_candidate_sandbox_id = daytona_sandbox.id
+                        try:
+                            await inner._cleanup_process_environment_failed_candidate()
+                        except Exception:
+                            pass
+                    state.sandbox_id = previous_sandbox_id
+                    state.workspace_root_ready = previous_workspace_root_ready
+                    inner._sandbox = previous_sandbox
+                    raise
+                inner._process_environment_resume_start = None
+                inner._process_environment_resume_started = True
+                await inner._retire_process_environment_previous_sandbox(
+                    previous_sandbox=previous_sandbox
+                )
+
+            inner._process_environment_resume_start = start_replacement
+            return self._wrap_session(inner, instrumentation=self._instrumentation)
 
         daytona_sandbox = None
         reconnected = False
-        try:
-            daytona_sandbox = await self._daytona.get(state.sandbox_id)
-            SandboxState = _import_sandbox_state()
-            if getattr(daytona_sandbox, "state", None) != SandboxState.STARTED:
-                await daytona_sandbox.start(timeout=state.start_timeout)
-            reconnected = True
-        except Exception as e:
-            log_tool_action_debug(logger, "Daytona sandbox lookup failed; recreating", e)
+        if not state.manifest._has_process_environment_values():
+            try:
+                daytona_sandbox = await self._daytona.get(state.sandbox_id)
+                SandboxState = _import_sandbox_state()
+                if getattr(daytona_sandbox, "state", None) != SandboxState.STARTED:
+                    await daytona_sandbox.start(timeout=state.start_timeout)
+                reconnected = True
+            except Exception as e:
+                log_tool_action_debug(logger, "Daytona sandbox lookup failed; recreating", e)
 
         if not reconnected or daytona_sandbox is None:
             params = await self._build_create_params(

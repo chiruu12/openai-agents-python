@@ -333,6 +333,7 @@ class SandboxSessionState(BaseModel):
             self.manifest,
             provider_backend_id=self.type,
         )
+        self.manifest._validate_process_environment_access()
 
         if self.mount_authority_redacted:
             raise ValueError(

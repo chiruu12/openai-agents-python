@@ -10,7 +10,7 @@ import pytest
 
 from agents.sandbox import SandboxPathGrant
 from agents.sandbox.errors import PtySessionNotFoundError
-from agents.sandbox.manifest import Manifest
+from agents.sandbox.manifest import Environment, Manifest, ProcessEnvValue
 from agents.sandbox.sandboxes.unix_local import (
     UnixLocalSandboxClient,
     UnixLocalSandboxSession,
@@ -39,6 +39,25 @@ class _RecordingUnixLocalSession(UnixLocalSandboxSession):
         _ = timeout
         self.exec_commands.append(tuple(str(part) for part in command))
         return ExecResult(stdout=b"", stderr=b"", exit_code=0)
+
+
+@pytest.mark.asyncio
+async def test_unix_local_rejects_process_environment_before_creating_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _unexpected_mkdtemp(*args: object, **kwargs: object) -> str:
+        raise AssertionError(f"unexpected mkdtemp call: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(
+        "agents.sandbox.sandboxes.unix_local.tempfile.mkdtemp",
+        _unexpected_mkdtemp,
+    )
+    manifest = Manifest(
+        environment=Environment(value={"TOKEN": ProcessEnvValue(name="PROD_KEY")})
+    )._with_process_environment_access(("TOKEN", "PROD_KEY"))
+
+    with pytest.raises(ValueError, match="unix_local does not support ProcessEnvValue"):
+        await UnixLocalSandboxClient().create(manifest=manifest)
 
 
 @pytest.mark.asyncio
